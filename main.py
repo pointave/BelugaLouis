@@ -13,6 +13,13 @@ from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import requests
+import concurrent.futures
+import queue
+import threading
+import numpy as np
+import concurrent.futures
+import queue
+import threading
 
 class FileProcessingWorker(QObject):
     """Worker class for processing files in a separate thread."""
@@ -336,18 +343,37 @@ class ThumbnailListItem(QListWidgetItem):
 
 class FileRenamer(QWidget):
     def __init__(self):
+        # Initialize parent class first
         super().__init__()
+        
+        # Basic window setup
         self.setWindowTitle('Beluga Louis')
         self.resize(800, 500)
+        
+        # Initialize instance variables
         self.directory = ''
         self.files = []
-        self.settings = QSettings('OllamaRenamer', 'PyQtFileRenamer')
         self.models = []
-        self.last_selected_model = self.settings.value('last_model', '')
-        self.last_opened_folder = self.settings.value('last_folder', '')
-        self.rename_history = self.settings.value('rename_history', {})
         self.is_processing = False
-
+        
+        # Initialize settings
+        self.settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+        self.settings = {}
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r') as f:
+                    self.settings = json.load(f)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            self.settings = {}
+            
+        # Load settings values
+        self.last_selected_model = self.settings.get('last_model', '')
+        self.last_opened_folder = self.settings.get('last_folder', '')
+        self.rename_history = self.settings.get('rename_history', {})
+        self.last_case = self.settings.get('last_case', 'kebab-case')
+        self.system_prompt = self.settings.get('system_prompt', 'You are an expert file and media renamer. Always return a single, concise filename as instructed.')
+        
         # Threading components
         self.worker_thread = None
         self.worker = None
@@ -363,11 +389,28 @@ class FileRenamer(QWidget):
             ('lower case', 'lower case'),
             ('UPPER CASE', 'UPPER CASE'),
         ]
-        self.last_case = self.settings.value('last_case', 'kebab-case')
-        self.system_prompt = self.settings.value('system_prompt', 'You are an expert file and media renamer. Always return a single, concise filename as instructed.')
         
         # Thumbnail cache
         self.thumbnail_cache = {}
+        # Background thumbnail generation
+        self._thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._thumb_results = queue.Queue()
+        self._thumb_pending = set()
+        self.file_items = {}  # map file_path -> QListWidgetItem
+
+        # Poll timer to process thumbnails from background threads
+        from PyQt6.QtCore import QTimer
+        self._thumb_timer = QTimer()
+        self._thumb_timer.setInterval(80)
+        self._thumb_timer.timeout.connect(self._process_thumbnail_results)
+        self._thumb_timer.start()
+
+        # Debounce timer for preview generation to avoid blocking during fast navigation
+        self._preview_timer = QTimer()
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(150)
+        self._preview_timer.timeout.connect(self._do_show_pending_preview)
+        self._pending_preview_filename = None
         
         # Video player components
         self.media_player = QMediaPlayer()
@@ -728,13 +771,102 @@ class FileRenamer(QWidget):
         
         return None
 
+    def _generate_thumbnail_bytes(self, file_path):
+        """Background-friendly thumbnail generator. Returns JPEG bytes or None."""
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff']:
+                # Read image and resize with OpenCV
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                nparr = np.frombuffer(data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img is None:
+                    return None
+                h, w = img.shape[:2]
+                max_dim = max(h, w)
+                if max_dim > 48:
+                    scale = 48.0 / max_dim
+                    img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if ok:
+                    return buf.tobytes()
+                return None
+            elif ext in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
+                cap = cv2.VideoCapture(file_path)
+                if not cap.isOpened():
+                    return None
+                ret, frame = cap.read()
+                cap.release()
+                if not ret or frame is None:
+                    return None
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if ok:
+                    return buf.tobytes()
+                return None
+        except Exception:
+            return None
+
+    def _process_thumbnail_results(self):
+        """Process completed thumbnail bytes from background threads and set icons on items."""
+        try:
+            while True:
+                file_path, data = self._thumb_results.get_nowait()
+                try:
+                    if data:
+                        pix = QPixmap()
+                        if pix.loadFromData(data):
+                            icon = QIcon(pix)
+                            self.thumbnail_cache[file_path] = icon
+                            item = self.file_items.get(file_path)
+                            if item:
+                                item.setIcon(icon)
+                except Exception:
+                    pass
+                finally:
+                    self._thumb_pending.discard(file_path)
+        except queue.Empty:
+            return
+
+    def _do_show_pending_preview(self):
+        """Called by debounce timer to actually show the pending preview."""
+        try:
+            if self._pending_preview_filename:
+                # It's safe to call the synchronous preview now; user likely paused navigation
+                self.show_preview(self._pending_preview_filename)
+        finally:
+            self._pending_preview_filename = None
+
+    def load_settings(self):
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading settings: {e}")
+        return {}
+
+    def save_settings(self):
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump({
+                    'last_model': self.last_selected_model,
+                    'last_folder': self.last_opened_folder,
+                    'rename_history': self.rename_history,
+                    'last_case': self.last_case,
+                    'system_prompt': self.system_prompt
+                }, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Select Folder')
+        folder = QFileDialog.getExistingDirectory(self, 'Select Folder', self.last_opened_folder)
         if folder:
             self.directory = folder
             self.dir_label.setText(folder)
-            self.settings.setValue('last_folder', folder)
             self.last_opened_folder = folder
+            self.settings['last_folder'] = folder
+            self.save_settings()
             self.revert_button.setEnabled(False)
             self.original_files_order = []
             self.thumbnail_cache.clear()  # Clear cache when changing folders
@@ -756,21 +888,24 @@ class FileRenamer(QWidget):
         self.original_files_order = [(i, filename) for i, filename in enumerate(current_files)]
         self.file_list.clear()
         
-        # Add files with thumbnails
+        # Add files and schedule background thumbnail generation
         for filename in self.files:
             file_path = os.path.join(self.directory, filename)
             item = QListWidgetItem(filename)
-            
-            # Create and cache thumbnail
-            if file_path not in self.thumbnail_cache:
-                thumbnail = self.create_thumbnail(file_path)
-                if thumbnail:
-                    self.thumbnail_cache[file_path] = QIcon(thumbnail)
-            
-            # Set icon if available
+            # Keep mapping from path to item for later icon updates
+            self.file_items[file_path] = item
+
+            # If thumbnail is cached, set it immediately
             if file_path in self.thumbnail_cache:
                 item.setIcon(self.thumbnail_cache[file_path])
-            
+            else:
+                # Schedule background thumbnail generation if not already pending
+                if file_path not in self._thumb_pending:
+                    self._thumb_pending.add(file_path)
+                    future = self._thumb_executor.submit(self._generate_thumbnail_bytes, file_path)
+                    # When done, put result into queue for main-thread processing
+                    future.add_done_callback(lambda f, fp=file_path: self._thumb_results.put((fp, f.result())))
+
             self.file_list.addItem(item)
         
         self.clear_preview()
@@ -924,8 +1059,16 @@ class FileRenamer(QWidget):
         selected_items = self.file_list.selectedItems()
         if selected_items:
             filename = selected_items[0].text()
-            self.show_preview(filename)
+            # Debounce heavy preview work so quick up/down navigation doesn't block UI
+            self._pending_preview_filename = filename
+            self._preview_timer.start()
         else:
+            # Cancel any pending preview
+            try:
+                self._preview_timer.stop()
+            except Exception:
+                pass
+            self._pending_preview_filename = None
             self.clear_preview()
 
     def show_preview(self, filename):
@@ -1178,29 +1321,45 @@ class FileRenamer(QWidget):
         self.model_combo.addItems(models)
         self.models = models
         
-        if self.last_selected_model and self.last_selected_model in models:
-            idx = models.index(self.last_selected_model)
-            self.model_combo.setCurrentIndex(idx)
 
     def save_last_model(self):
         model = self.model_combo.currentText()
-        self.settings.setValue('last_model', model)
+        self.settings['last_model'] = model
+        self.save_settings()
         self.last_selected_model = model
 
     def save_last_case(self):
         idx = self.case_group.checkedId()
         case_value = self.cases[idx][1]
-        self.settings.setValue('last_case', case_value)
+        self.settings['last_case'] = case_value
+        self.save_settings()
         self.last_case = case_value
 
     def save_system_prompt(self):
         self.system_prompt = self.system_input.text()
-        self.settings.setValue('system_prompt', self.system_prompt)
+        self.settings['system_prompt'] = self.system_prompt
+        self.save_settings()
+
+    def save_settings(self):
+        try:
+            with open(self.settings_file, 'w') as f:
+                # Update settings dictionary with current values
+                self.settings.update({
+                    'last_model': self.last_selected_model,
+                    'last_folder': self.last_opened_folder,
+                    'rename_history': self.rename_history,
+                    'last_case': self.last_case,
+                    'system_prompt': self.system_prompt
+                })
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
 
     def rename_files(self):
         if not self.files:
             QMessageBox.warning(self, 'No Files', 'No files to rename in the selected folder.')
             return
+# ... (rest of the code remains the same)
 
         model = self.model_combo.currentText()
         if not model:
