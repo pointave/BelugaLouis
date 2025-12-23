@@ -186,7 +186,7 @@ class FileProcessingWorker(QObject):
 
                         prompt = '\n'.join(prompt_lines)
 
-                        # Handle different API endpoints for Ollama vs LM Studio
+                        # Handle different API endpoints for Ollama vs LM Studio vs llama.cpp
                         if self.model.startswith("lmstudio::"):
                             # LM Studio API call
                             actual_model = self.model.replace("lmstudio::", "")
@@ -225,6 +225,51 @@ class FileProcessingWorker(QObject):
                                 return
                             
                             resp = requests.post('http://localhost:1234/v1/chat/completions', json=lm_payload, timeout=60)
+                            if not self.is_running:
+                                self.processing_stopped.emit(processed_count)
+                                return
+                            resp.raise_for_status()
+                            data = resp.json()
+                            full_response = data['choices'][0]['message']['content'].strip()
+                        
+                        elif self.model.startswith("llamacpp::"):
+                            # llama.cpp API call
+                            actual_model = self.model.replace("llamacpp::", "")
+                            
+                            # Build messages with images if available
+                            user_content = []
+                            
+                            # Add text prompt
+                            user_content.append({
+                                "type": "text",
+                                "text": prompt
+                            })
+                            
+                            # Add images if present
+                            for img_b64 in images_b64:
+                                user_content.append({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{img_b64}"
+                                    }
+                                })
+                            
+                            llamacpp_payload = {
+                                "model": actual_model,
+                                "messages": [
+                                    {"role": "system", "content": self.system_prompt or "You are an expert file and media renamer."},
+                                    {"role": "user", "content": user_content if images_b64 else prompt}
+                                ],
+                                "max_tokens": 50,
+                                "temperature": 0.7
+                            }
+                            
+                            # Check stop flag before API call
+                            if not self.is_running:
+                                self.processing_stopped.emit(processed_count)
+                                return
+                            
+                            resp = requests.post('http://localhost:8080/v1/chat/completions', json=llamacpp_payload, timeout=60)
                             if not self.is_running:
                                 self.processing_stopped.emit(processed_count)
                                 return
@@ -411,7 +456,7 @@ class FileRenamer(QWidget):
         self._preview_timer.setInterval(150)
         self._preview_timer.timeout.connect(self._do_show_pending_preview)
         self._pending_preview_filename = None
-        
+
         # Video player components
         self.media_player = QMediaPlayer()
         self.video_widget = QVideoWidget()
@@ -428,6 +473,19 @@ class FileRenamer(QWidget):
         
         # Track playback state for slider interaction
         self.was_playing = False
+        
+        # Setup the UI
+        self.setup_ui()
+    
+    def save_settings(self):
+        """Save settings to JSON file."""
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
+    def setup_ui(self):
         
         # Set window icon
         try:
@@ -1289,7 +1347,7 @@ class FileRenamer(QWidget):
         # Get Ollama models
         ollama_models = []
         try:
-            resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+            resp = requests.get('http://localhost:11434/api/tags', timeout=.5)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'models' in data:
@@ -1300,7 +1358,7 @@ class FileRenamer(QWidget):
         # Get LM Studio models
         lmstudio_models = []
         try:
-            resp = requests.get('http://localhost:1234/v1/models', timeout=3)
+            resp = requests.get('http://localhost:1234/v1/models', timeout=.5)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'data' in data:
@@ -1312,10 +1370,23 @@ class FileRenamer(QWidget):
         except Exception as e:
             print(f"Warning: Could not fetch LM Studio models: {e}")
 
-        models = ollama_models + lmstudio_models
+        # Get llama.cpp models
+        llamacpp_models = []
+        try:
+            resp = requests.get('http://localhost:8080/v1/models', timeout=.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'data' in data:
+                    for model in data['data']:
+                        if 'id' in model:
+                            llamacpp_models.append(f"llamacpp::{model['id']}")
+        except Exception as e:
+            print(f"Warning: Could not fetch llama.cpp models: {e}")
+
+        models = ollama_models + lmstudio_models + llamacpp_models
 
         if not models:
-            models = ['llava:latest']
+            models = ['qwen3-vl:4b']
 
         self.model_combo.clear()
         self.model_combo.addItems(models)
@@ -1475,7 +1546,8 @@ class FileRenamer(QWidget):
         """Handle processing completion."""
         self.cleanup_processing()
         self.rename_history.update(self.current_rename_history)
-        self.settings.setValue('rename_history', self.rename_history)
+        self.settings['rename_history'] = self.rename_history
+        self.save_settings()
         self.revert_button.setEnabled(True)
         QMessageBox.information(self, 'Success', f'Renamed {total_processed} files using AI models!')
 
@@ -1484,7 +1556,8 @@ class FileRenamer(QWidget):
         """Handle processing being stopped early."""
         self.cleanup_processing()
         self.rename_history.update(self.current_rename_history)
-        self.settings.setValue('rename_history', self.rename_history)
+        self.settings['rename_history'] = self.rename_history
+        self.save_settings()
         self.revert_button.setEnabled(True)
         QMessageBox.information(self, 'Stopped', f'Processing stopped after renaming {total_processed} files.')
 
@@ -1493,7 +1566,12 @@ class FileRenamer(QWidget):
         """Handle errors during processing."""
         model_type = "Unknown"
         if self.worker and hasattr(self.worker, 'model'):
-            model_type = "LM Studio" if self.worker.model.startswith("lmstudio::") else "Ollama"
+            if self.worker.model.startswith("lmstudio::"):
+                model_type = "LM Studio"
+            elif self.worker.model.startswith("llamacpp::"):
+                model_type = "llama.cpp"
+            else:
+                model_type = "Ollama"
         QMessageBox.warning(self, 'AI Error', f'Failed to rename {filename} using {model_type}: {error_message}')
 
     def cleanup_processing(self):
@@ -1542,7 +1620,8 @@ class FileRenamer(QWidget):
                     reverted_count += 1
 
             self.rename_history = {}
-            self.settings.setValue('rename_history', {})
+            self.settings['rename_history'] = {}
+            self.save_settings()
             self.revert_button.setEnabled(False)
 
             QMessageBox.information(self, 'Success', f'Successfully reverted {reverted_count} file renames!')
